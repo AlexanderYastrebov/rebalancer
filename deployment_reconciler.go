@@ -164,15 +164,15 @@ func (r *DeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 // removeGates removes scheduling gates and labels pods to up to the computed target count.
 func (r *DeploymentReconciler) removeGates(ctx context.Context, pods []*corev1.Pod, cfg WorkloadConfig, disabled bool) (int, int, error) {
 	gated, labeled, _ := partitionPods(pods, cfg.Labels, r.Config)
-	total := len(pods)
-	target := targetLabeledCount(total, cfg)
-	actual := len(labeled)
-
 	if len(gated) == 0 {
 		return 0, 0, nil
 	}
 
 	// Remove gates and add labels, node selectors and tolerations
+	total := len(pods)
+	target := targetLabeledCount(total, cfg)
+	actual := len(labeled)
+
 	toLabel := 0
 	if !disabled {
 		maxToLabel := max(0, target-actual)
@@ -180,7 +180,7 @@ func (r *DeploymentReconciler) removeGates(ctx context.Context, pods []*corev1.P
 	}
 
 	var errs []error
-	for i, pod := range pods {
+	for i, pod := range gated {
 		patch := client.MergeFrom(pod.DeepCopy())
 
 		pod.Spec.SchedulingGates = slices.DeleteFunc(pod.Spec.SchedulingGates, func(g corev1.PodSchedulingGate) bool {
@@ -194,7 +194,7 @@ func (r *DeploymentReconciler) removeGates(ctx context.Context, pods []*corev1.P
 		}
 
 		if err := r.Patch(ctx, pod, patch); err != nil {
-			errs = append(errs, fmt.Errorf("failed to patch pod: %s", pod.Name))
+			errs = append(errs, fmt.Errorf("failed to patch pod %s: %w", pod.Name, err))
 		}
 	}
 	return len(gated), toLabel, errors.Join(errs...)
@@ -221,7 +221,7 @@ func (r *DeploymentReconciler) getPodsByReplicaSets(ctx context.Context, deploy 
 func (r *DeploymentReconciler) getReplicaSetsForDeployment(ctx context.Context, deploy *appsv1.Deployment) ([]*appsv1.ReplicaSet, error) {
 	deploymentSelector, err := metav1.LabelSelectorAsSelector(deploy.Spec.Selector)
 	if err != nil {
-		return nil, fmt.Errorf("deployment %s/%s has invalid label selector: %v", deploy.Namespace, deploy.Name, err)
+		return nil, fmt.Errorf("deployment %s/%s has invalid label selector: %w", deploy.Namespace, deploy.Name, err)
 	}
 
 	var rsList appsv1.ReplicaSetList
@@ -269,9 +269,9 @@ func (r *DeploymentReconciler) disableDeployment(ctx context.Context, deploy *ap
 // evictPods evicts a list of pods.
 func (r *DeploymentReconciler) evictPods(ctx context.Context, pods []*corev1.Pod) error {
 	var errs []error
-	for i := range pods {
-		if err := r.evictPod(ctx, pods[i]); err != nil {
-			errs = append(errs, fmt.Errorf("failed to evict pod: %s", pods[i].Name))
+	for _, pod := range pods {
+		if err := r.evictPod(ctx, pod); err != nil {
+			errs = append(errs, fmt.Errorf("failed to evict pod %s: %w", pod.Name, err))
 		}
 	}
 	return errors.Join(errs...)

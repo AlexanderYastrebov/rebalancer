@@ -225,14 +225,8 @@ func (s *ControllerSuite) TestEnabledDeploymentIsLabeled() {
 	// Step 2: assert labeled / unlabeled split.
 	pods := s.listPods(client.MatchingLabels{"deployment": "nginx"})
 
-	var labeled, unlabeled []*corev1.Pod
-	for _, pod := range pods {
-		if isPodLabeled(pod, s.c) {
-			labeled = append(labeled, pod)
-		} else {
-			unlabeled = append(unlabeled, pod)
-		}
-	}
+	labeled, unlabeled := s.partitionLabeled(pods)
+
 	assert.Len(t, labeled, wantLabeled, "wrong number of labeled pods")
 	assert.Len(t, unlabeled, wantUnlabeled, "wrong number of unlabeled pods")
 
@@ -279,14 +273,8 @@ func (s *ControllerSuite) TestEnabledDeploymentRollout() {
 	// Step 3: assert labeled / unlabeled split.
 	pods := s.listPods(client.MatchingLabels{"deployment": "nginx"})
 
-	var labeled, unlabeled []*corev1.Pod
-	for _, pod := range pods {
-		if isPodLabeled(pod, s.c) {
-			labeled = append(labeled, pod)
-		} else {
-			unlabeled = append(unlabeled, pod)
-		}
-	}
+	labeled, unlabeled := s.partitionLabeled(pods)
+
 	assert.Len(t, labeled, wantLabeled, "wrong number of labeled pods")
 	assert.Len(t, unlabeled, wantUnlabeled, "wrong number of unlabeled pods")
 }
@@ -324,16 +312,10 @@ func (s *ControllerSuite) TestDeploymentEnable() {
 			return false
 		}
 
-		var labeled, unlabeled int
-		for _, pod := range pods {
-			if isPodLabeled(pod, s.c) {
-				labeled++
-			} else {
-				unlabeled++
-			}
-		}
-		t.Logf("unlabeled: %d, labeled: %d", unlabeled, labeled)
-		return labeled == wantLabeled && unlabeled == wantUnlabeled
+		labeled, unlabeled := s.partitionLabeled(pods)
+
+		t.Logf("unlabeled: %d, labeled: %d", len(unlabeled), len(labeled))
+		return len(labeled) == wantLabeled && len(unlabeled) == wantUnlabeled
 	}, 1*time.Minute, 1*time.Second)
 }
 
@@ -382,16 +364,10 @@ func (s *ControllerSuite) TestDeploymentEnableFallback() {
 			return false
 		}
 
-		var labeled, unlabeled int
-		for _, pod := range pods {
-			if isPodLabeled(pod, s.c) {
-				labeled++
-			} else {
-				unlabeled++
-			}
-		}
-		t.Logf("unlabeled: %d, labeled: %d", unlabeled, labeled)
-		return labeled == 0 && unlabeled == replicas
+		labeled, unlabeled := s.partitionLabeled(pods)
+
+		t.Logf("unlabeled: %d, labeled: %d", len(unlabeled), len(labeled))
+		return len(labeled) == 0 && len(unlabeled) == replicas
 	}, 2*time.Minute, 2*time.Second)
 
 	// Step 5: uncordon reserved node
@@ -406,16 +382,10 @@ func (s *ControllerSuite) TestDeploymentEnableFallback() {
 			return false
 		}
 
-		var labeled, unlabeled int
-		for _, pod := range pods {
-			if isPodLabeled(pod, s.c) {
-				labeled++
-			} else {
-				unlabeled++
-			}
-		}
-		t.Logf("unlabeled: %d, labeled: %d", unlabeled, labeled)
-		return labeled == wantLabeled && unlabeled == wantUnlabeled
+		labeled, unlabeled := s.partitionLabeled(pods)
+
+		t.Logf("unlabeled: %d, labeled: %d", len(unlabeled), len(labeled))
+		return len(labeled) == wantLabeled && len(unlabeled) == wantUnlabeled
 	}, 2*time.Minute, 2*time.Second)
 }
 
@@ -469,11 +439,21 @@ func (s *ControllerSuite) uncordonReservedNode() {
 	s.T().Logf("Uncordoned node %s", s.reservedNode)
 }
 
-// isPodLabeled reports whether pod has all controller-applied labels, node
-// selector, and tolerations (i.e. it was fully processed as a "labeled" pod).
-func isPodLabeled(pod *corev1.Pod, c *Controller) bool {
-	cfg := c.DefaultWorkloadConfig
+func (s *ControllerSuite) partitionLabeled(pods []*corev1.Pod) ([]*corev1.Pod, []*corev1.Pod) {
+	var labeled, unlabeled []*corev1.Pod
+	for _, pod := range pods {
+		if isLabeled(pod, s.c.DefaultWorkloadConfig) {
+			labeled = append(labeled, pod)
+		} else {
+			unlabeled = append(unlabeled, pod)
+		}
+	}
+	return labeled, unlabeled
+}
 
+// isLabeled reports whether pod has all controller-applied labels, node
+// selector, and tolerations (i.e. it was fully processed as a "labeled" pod).
+func isLabeled(pod *corev1.Pod, cfg WorkloadConfig) bool {
 	for k, v := range cfg.Labels {
 		if pod.Labels[k] != v {
 			return false
