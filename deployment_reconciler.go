@@ -68,7 +68,7 @@ func (r *DeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// Remove gates
 	var gatesTotal, labeledTotal int
 	for rs, pods := range podsByRs {
-		gates, labeled, err := r.removeGatesForOwner(ctx, pods, cfg, disabled)
+		gates, labeled, err := r.removeGates(ctx, pods, cfg, disabled)
 		if err != nil {
 			logger.Error(err, "Failed to remove gates", "rs", rs)
 		}
@@ -161,27 +161,24 @@ func (r *DeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	return untilNextCheck()
 }
 
-func (r *DeploymentReconciler) removeGatesForOwner(ctx context.Context, pods []*corev1.Pod, cfg WorkloadConfig, disabled bool) (int, int, error) {
+// removeGates removes scheduling gates and labels pods to up to the computed target count.
+func (r *DeploymentReconciler) removeGates(ctx context.Context, pods []*corev1.Pod, cfg WorkloadConfig, disabled bool) (int, int, error) {
 	gated, labeled, _ := partitionPods(pods, cfg.Labels, r.Config)
 	total := len(pods)
 	target := targetLabeledCount(total, cfg)
 	actual := len(labeled)
 
-	// Remove gates and add labels, node selectors and tolerations
-	if len(gated) > 0 {
-		toLabel := 0
-		if !disabled {
-			maxToLabel := max(0, target-actual)
-			toLabel = min(len(gated), maxToLabel)
-		}
-
-		err := r.removeGatesAddLabel(ctx, gated, toLabel, cfg)
-		return len(gated), toLabel, err
+	if len(gated) == 0 {
+		return 0, 0, nil
 	}
-	return 0, 0, nil
-}
 
-func (r *DeploymentReconciler) removeGatesAddLabel(ctx context.Context, pods []*corev1.Pod, toLabel int, cfg WorkloadConfig) error {
+	// Remove gates and add labels, node selectors and tolerations
+	toLabel := 0
+	if !disabled {
+		maxToLabel := max(0, target-actual)
+		toLabel = min(len(gated), maxToLabel)
+	}
+
 	var errs []error
 	for i, pod := range pods {
 		patch := client.MergeFrom(pod.DeepCopy())
@@ -200,7 +197,7 @@ func (r *DeploymentReconciler) removeGatesAddLabel(ctx context.Context, pods []*
 			errs = append(errs, fmt.Errorf("failed to patch pod: %s", pod.Name))
 		}
 	}
-	return errors.Join(errs...)
+	return len(gated), toLabel, errors.Join(errs...)
 }
 
 func mapsAppend(m, v map[string]string) map[string]string {
