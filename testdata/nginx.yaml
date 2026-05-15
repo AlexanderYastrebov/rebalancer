@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+  labels:
+    app: nginx
+    rebalancer/enabled: "true"
+  annotations:
+    rebalancer/config: |
+      {
+        "labeledPercentage": 60,
+        "minUnlabeled": 2,
+        "tolerations": [{"key": "nodepool", "value": "reserved", "operator": "Equal"}]
+      }
+spec:
+  replicas: 10
+  selector:
+    matchLabels:
+      deployment: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+        deployment: nginx
+    spec:
+      containers:
+        - name: nginx
+          image: registry.k8s.io/pause:3.10.1

@@ -1,0 +1,133 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: rebalancer
+  namespace: default
+spec:
+  dnsNames:
+    - rebalancer.default.svc
+    - rebalancer.default.svc.cluster.local
+  issuerRef:
+    name: selfsigned-issuer
+    kind: Issuer
+  secretName: rebalancer-certs
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rebalancer
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: rebalancer
+rules:
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [list, watch]
+  # TODO: avoid requiring replicasets
+  - apiGroups: [apps]
+    resources: [replicasets]
+    verbs: [list, watch]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [list, watch, patch]
+  - apiGroups: [""]
+    resources: [pods/eviction]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: rebalancer
+subjects:
+  - kind: ServiceAccount
+    name: rebalancer
+    namespace: default
+roleRef:
+  kind: ClusterRole
+  name: rebalancer
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rebalancer
+  labels:
+    app: rebalancer
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      deployment: rebalancer
+  template:
+    metadata:
+      labels:
+        app: rebalancer
+        deployment: rebalancer
+    spec:
+      serviceAccountName: rebalancer
+      containers:
+        - name: rebalancer
+          image: rebalancer:latest
+          # For testing in kind:
+          imagePullPolicy: IfNotPresent
+          args:
+            - --webhook-port=9443
+            - --webhook-cert-dir=/certs
+            - --zap-devel
+          volumeMounts:
+            - name: certs
+              mountPath: /certs
+              readOnly: true
+      volumes:
+        - name: certs
+          secret:
+            secretName: rebalancer-certs
+      resources:
+        limits:
+          cpu: 100m
+          memory: 128Mi
+        requests:
+          cpu: 100m
+          memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rebalancer
+  labels:
+    app: rebalancer
+spec:
+  selector:
+    deployment: rebalancer
+  ports:
+    - protocol: TCP
+      port: 443
+      targetPort: 9443
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: rebalancer
+  annotations:
+    cert-manager.io/inject-ca-from: default/rebalancer
+webhooks:
+  - name: rebalancer.example.test
+    admissionReviewVersions: [v1]
+    sideEffects: None
+    timeoutSeconds: 10
+    failurePolicy: Ignore
+    clientConfig:
+      service:
+        name: rebalancer
+        namespace: default
+        path: /mutate-v1-pod
+    rules:
+      - operations: [CREATE]
+        apiGroups: [""]
+        apiVersions: [v1]
+        resources: [pods]
