@@ -10,7 +10,6 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
-	"maps"
 	"math/big"
 	"net"
 	"os"
@@ -95,7 +94,7 @@ func (s *ControllerSuite) SetupSuite() {
 	t := s.T()
 	ctrl.SetLogger(zap.New(zap.UseDevMode(true), zap.WriteTo(s)))
 
-	s.clusterName = fmt.Sprintf("rebalancer-test-%d", time.Now().UnixNano())
+	s.clusterName = fmt.Sprintf("rebalancer-test-%s", time.Now().Format("2006-01-02-15-04-05"))
 	s.provider = cluster.NewProvider()
 
 	t.Logf("Creating kind cluster %q", s.clusterName)
@@ -224,15 +223,33 @@ func ptrList[T any](items []T, accept func(*T) bool) []*T {
 	return result
 }
 
-func (s *ControllerSuite) requireEventuallyHasPhaseCounts(expected map[corev1.PodPhase]int, opts ...client.ListOption) {
+func (s *ControllerSuite) requireEventuallyRunningSplit(wantLabeled, wantUnlabeled int, opts ...client.ListOption) {
 	t := s.T()
 	t.Helper()
-	require.Eventually(t, func() bool {
-		pods := s.listPods(client.MatchingLabels{"deployment": "nginx"})
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		pods := s.listPods(opts...)
 		byPhase := countByPhase(pods)
-		t.Logf("Pods: %v", byPhase)
-		return maps.Equal(expected, byPhase)
-	}, 1*time.Minute, 1*time.Second)
+		if !assert.Equal(c, wantLabeled+wantUnlabeled, byPhase[corev1.PodRunning]) {
+			t.Logf("Pods: %v", byPhase)
+		}
+
+		labeled, unlabeled := s.partitionLabeled(pods)
+		if !assert.Len(c, labeled, wantLabeled) {
+			t.Logf("labeled: %d != %d", len(labeled), wantLabeled)
+		}
+		if !assert.Len(c, unlabeled, wantUnlabeled) {
+			t.Logf("unlabeled: %d != %d", len(unlabeled), wantUnlabeled)
+		}
+
+		for _, pod := range labeled {
+			assert.Equal(c, s.reservedNode, pod.Spec.NodeName,
+				"labeled pod %s should be on reserved node", pod.Name)
+		}
+		for _, pod := range unlabeled {
+			assert.NotEqual(c, s.reservedNode, pod.Spec.NodeName,
+				"unlabeled pod %s should NOT be on reserved node", pod.Name)
+		}
+	}, 1*time.Minute, 2*time.Second)
 }
 
 // --- Test cases ---
@@ -251,26 +268,7 @@ func (s *ControllerSuite) TestEnabledDeploymentIsLabeled() {
 
 	require.NoError(t, s.directClient.Create(s.ctx, deploy))
 
-	// Step 1: wait for all pods to be Running.
-	s.requireEventuallyHasPhaseCounts(map[corev1.PodPhase]int{corev1.PodRunning: replicas}, client.MatchingLabels{"deployment": "nginx"})
-
-	// Step 2: assert labeled / unlabeled split.
-	pods := s.listPods(client.MatchingLabels{"deployment": "nginx"})
-
-	labeled, unlabeled := s.partitionLabeled(pods)
-
-	assert.Len(t, labeled, wantLabeled, "wrong number of labeled pods")
-	assert.Len(t, unlabeled, wantUnlabeled, "wrong number of unlabeled pods")
-
-	// Step 3: assert node placement.
-	for _, pod := range labeled {
-		assert.Equal(t, s.reservedNode, pod.Spec.NodeName,
-			"labeled pod %s should be on reserved node", pod.Name)
-	}
-	for _, pod := range unlabeled {
-		assert.NotEqual(t, s.reservedNode, pod.Spec.NodeName,
-			"unlabeled pod %s should NOT be on reserved node", pod.Name)
-	}
+	s.requireEventuallyRunningSplit(6, 4, client.MatchingLabels{"deployment": deployName})
 }
 
 func (s *ControllerSuite) TestEnabledDeploymentRollout() {
@@ -288,7 +286,7 @@ func (s *ControllerSuite) TestEnabledDeploymentRollout() {
 	require.NoError(t, s.directClient.Create(s.ctx, deploy))
 
 	// Step 1: wait for all pods to be Running.
-	s.requireEventuallyHasPhaseCounts(map[corev1.PodPhase]int{corev1.PodRunning: replicas}, client.MatchingLabels{"deployment": "nginx"})
+	s.requireEventuallyRunningSplit(6, 4, client.MatchingLabels{"deployment": deployName})
 
 	// Step 2: rollout by patching the deployment pod spec template.
 	t.Logf("Rollout")
@@ -300,15 +298,7 @@ func (s *ControllerSuite) TestEnabledDeploymentRollout() {
 	require.NoError(t, s.directClient.Patch(s.ctx, deploy, rolloutPatch))
 
 	// Wait for rollout to complete: all pods running.
-	s.requireEventuallyHasPhaseCounts(map[corev1.PodPhase]int{corev1.PodRunning: replicas}, client.MatchingLabels{"deployment": "nginx"})
-
-	// Step 3: assert labeled / unlabeled split.
-	pods := s.listPods(client.MatchingLabels{"deployment": "nginx"})
-
-	labeled, unlabeled := s.partitionLabeled(pods)
-
-	assert.Len(t, labeled, wantLabeled, "wrong number of labeled pods")
-	assert.Len(t, unlabeled, wantUnlabeled, "wrong number of unlabeled pods")
+	s.requireEventuallyRunningSplit(6, 4, client.MatchingLabels{"deployment": deployName})
 }
 
 func (s *ControllerSuite) TestDeploymentEnable() {
@@ -324,7 +314,7 @@ func (s *ControllerSuite) TestDeploymentEnable() {
 	require.NoError(t, s.directClient.Create(s.ctx, deploy))
 
 	// Step 1: wait for all pods to be Running.
-	s.requireEventuallyHasPhaseCounts(map[corev1.PodPhase]int{corev1.PodRunning: replicas}, client.MatchingLabels{"deployment": "nginx"})
+	s.requireEventuallyRunningSplit(0, 10, client.MatchingLabels{"deployment": deployName})
 
 	// Step 2: enable deployment
 	t.Logf("Enabling deployment")
@@ -336,19 +326,7 @@ func (s *ControllerSuite) TestDeploymentEnable() {
 	require.NoError(t, s.directClient.Patch(s.ctx, deploy, labelPatch))
 
 	// Step 3: assert labeled / unlabeled split.
-	require.Eventually(t, func() bool {
-		pods := s.listPods(client.MatchingLabels{"deployment": "nginx"})
-		byPhase := countByPhase(pods)
-		t.Logf("Pods: %v", byPhase)
-		if byPhase[corev1.PodRunning] != replicas {
-			return false
-		}
-
-		labeled, unlabeled := s.partitionLabeled(pods)
-
-		t.Logf("unlabeled: %d, labeled: %d", len(unlabeled), len(labeled))
-		return len(labeled) == wantLabeled && len(unlabeled) == wantUnlabeled
-	}, 1*time.Minute, 1*time.Second)
+	s.requireEventuallyRunningSplit(6, 4, client.MatchingLabels{"deployment": deployName})
 }
 
 func (s *ControllerSuite) TestDeploymentEnableFallback() {
@@ -364,7 +342,7 @@ func (s *ControllerSuite) TestDeploymentEnableFallback() {
 	require.NoError(t, s.directClient.Create(s.ctx, deploy))
 
 	// Step 1: wait for all pods to be Running.
-	s.requireEventuallyHasPhaseCounts(map[corev1.PodPhase]int{corev1.PodRunning: replicas}, client.MatchingLabels{"deployment": "nginx"})
+	s.requireEventuallyRunningSplit(0, 10, client.MatchingLabels{"deployment": deployName})
 
 	// Step 2: cordon reserved node
 	s.cordonReservedNode()
@@ -379,46 +357,30 @@ func (s *ControllerSuite) TestDeploymentEnableFallback() {
 	require.NoError(t, s.directClient.Patch(s.ctx, deploy, labelPatch))
 
 	// Step 4: assert fallback (zero labeled)
-	require.Eventually(t, func() bool {
-		var d appsv1.Deployment
-		require.NoError(t, s.directClient.Get(s.ctx, client.ObjectKeyFromObject(deploy), &d))
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		var deployment appsv1.Deployment
+		require.NoError(t, s.directClient.Get(s.ctx, client.ObjectKeyFromObject(deploy), &deployment))
 
-		if ts, ok := d.Annotations[s.c.Config.DisabledUntilAnnotation]; !ok {
-			return false
-		} else {
-			t.Logf("Disabled until: %s", ts)
-		}
+		assert.Contains(c, deployment.Annotations, s.c.Config.DisabledUntilAnnotation)
+	}, 1*time.Minute, 1*time.Second)
 
-		pods := s.listPods(client.MatchingLabels{"deployment": "nginx"})
-		byPhase := countByPhase(pods)
-		t.Logf("Pods: %v", byPhase)
-		if byPhase[corev1.PodRunning] != replicas {
-			return false
-		}
-
-		labeled, unlabeled := s.partitionLabeled(pods)
-
-		t.Logf("unlabeled: %d, labeled: %d", len(unlabeled), len(labeled))
-		return len(labeled) == 0 && len(unlabeled) == replicas
-	}, 2*time.Minute, 2*time.Second)
+	s.requireEventuallyRunningSplit(0, 10, client.MatchingLabels{"deployment": deployName})
 
 	// Step 5: uncordon reserved node
 	s.uncordonReservedNode()
 
+	var deployment appsv1.Deployment
+	require.NoError(t, s.directClient.Get(s.ctx, client.ObjectKeyFromObject(deploy), &deployment))
+
 	// Step 6: assert rebalanced
-	require.Eventually(t, func() bool {
-		pods := s.listPods(client.MatchingLabels{"deployment": "nginx"})
-		byPhase := countByPhase(pods)
-		t.Logf("Pods: %v", byPhase)
-		if byPhase[corev1.PodRunning] != replicas {
-			return false
-		}
+	ts, err := time.Parse(time.RFC3339, deployment.Annotations[s.c.Config.DisabledUntilAnnotation])
+	require.NoError(t, err)
 
-		labeled, unlabeled := s.partitionLabeled(pods)
+	d := time.Until(ts)
+	t.Logf("Waiting %v", d)
+	time.Sleep(d)
 
-		t.Logf("unlabeled: %d, labeled: %d", len(unlabeled), len(labeled))
-		return len(labeled) == wantLabeled && len(unlabeled) == wantUnlabeled
-	}, 2*time.Minute, 2*time.Second)
+	s.requireEventuallyRunningSplit(6, 4, client.MatchingLabels{"deployment": deployName})
 }
 
 func (s *ControllerSuite) newDeployment(name string, replicas int32) *appsv1.Deployment {
