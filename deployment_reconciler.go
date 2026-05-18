@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -13,7 +14,6 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -208,54 +208,34 @@ func mapsAppend(m, v map[string]string) map[string]string {
 	return m
 }
 
-func (r *DeploymentReconciler) getPodsByReplicaSets(ctx context.Context, deploy appsv1.Deployment) (map[types.UID][]*corev1.Pod, error) {
-	rsList, err := r.getReplicaSetsForDeployment(ctx, &deploy)
+// getPodsByReplicaSets returns Pods managed by this Deployment mapped by owning ReplicaSet.
+func (r *DeploymentReconciler) getPodsByReplicaSets(ctx context.Context, deployment appsv1.Deployment) (map[string][]*corev1.Pod, error) {
+	selector, err := metav1.LabelSelectorAsSelector(deployment.Spec.Selector)
+	if err != nil {
+		return nil, fmt.Errorf("deployment %s/%s has invalid label selector: %w", deployment.Namespace, deployment.Name, err)
+	}
+
+	var pods corev1.PodList
+	err = r.List(ctx, &pods,
+		client.InNamespace(deployment.Namespace),
+		client.MatchingLabelsSelector{Selector: selector},
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	return r.getPodMapForDeployment(ctx, rsList)
-}
+	result := make(map[string][]*corev1.Pod)
+	for i := range pods.Items {
+		pod := &pods.Items[i]
 
-// getReplicaSetsForDeployment returns the list of ReplicaSets that this Deployment manages.
-func (r *DeploymentReconciler) getReplicaSetsForDeployment(ctx context.Context, deploy *appsv1.Deployment) ([]*appsv1.ReplicaSet, error) {
-	deploymentSelector, err := metav1.LabelSelectorAsSelector(deploy.Spec.Selector)
-	if err != nil {
-		return nil, fmt.Errorf("deployment %s/%s has invalid label selector: %w", deploy.Namespace, deploy.Name, err)
-	}
-
-	var rsList appsv1.ReplicaSetList
-	if err := r.List(ctx, &rsList,
-		client.InNamespace(deploy.Namespace),
-		client.MatchingLabelsSelector{Selector: deploymentSelector},
-	); err != nil {
-		return nil, err
-	}
-	return ptrList(rsList.Items, func(rs *appsv1.ReplicaSet) bool {
-		controllerRef := metav1.GetControllerOfNoCopy(rs)
-		return controllerRef != nil && controllerRef.UID == deploy.GetUID()
-	}), nil
-}
-
-// getPodMapForDeployment returns the Pods managed by a Deployment.
-//
-// It returns a map from ReplicaSet UID to a non-empty list of Pods controlled by that RS.
-// The pod pointers returned by this method point the pod objects in the cache and thus
-// shouldn't be modified in any way.
-func (r *DeploymentReconciler) getPodMapForDeployment(ctx context.Context, rsList []*appsv1.ReplicaSet) (map[types.UID][]*corev1.Pod, error) {
-	// Group Pods by their controller (if it's in rsList).
-	podMap := make(map[types.UID][]*corev1.Pod, len(rsList))
-	for _, rs := range rsList {
-		// list all pods managed by this ReplicaSet using the pod indexer
-		pods, err := controllerFilterPodsByOwner(ctx, r.Client, &rs.ObjectMeta, "ReplicaSet")
-		if err != nil {
-			return nil, err
-		}
-		if len(pods) > 0 {
-			podMap[rs.UID] = pods
+		// Handle multiple Deployments with equal selectors
+		// by checking deployment name
+		rsName, deployName := deploymentName(pod)
+		if deployName == deployment.Name {
+			result[rsName] = append(result[rsName], pod)
 		}
 	}
-	return podMap, nil
+	return result, nil
 }
 
 // disableDeployment sets disabled annotation on the Deployment using a patch.
@@ -289,10 +269,6 @@ func (r *DeploymentReconciler) evictPod(ctx context.Context, pod *corev1.Pod) er
 }
 
 func (r *DeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	if err := addPodControllerIndexer(mgr); err != nil {
-		return err
-	}
-
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&appsv1.Deployment{},
 			builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
@@ -374,4 +350,25 @@ func countByPhase(pods []*corev1.Pod) map[corev1.PodPhase]int {
 		counts[pod.Status.Phase]++
 	}
 	return counts
+}
+
+// deploymentName returns ReplicaSet and Deployment name for a Pod or empty strings.
+func deploymentName(pod *corev1.Pod) (string, string) {
+	var rsName string
+	for _, ref := range pod.OwnerReferences {
+		if ref.Kind == "ReplicaSet" && ref.Controller != nil && *ref.Controller {
+			rsName = ref.Name
+			break
+		}
+	}
+	if rsName == "" {
+		return "", ""
+	}
+
+	// See generateReplicaSetName https://github.com/kubernetes/kubernetes/blob/ee954c1067272102c6b2dfe02bd98d5ed493a450/pkg/controller/deployment/sync.go#L557-L559
+	i := strings.LastIndex(rsName, "-")
+	if i <= 0 {
+		return rsName, ""
+	}
+	return rsName, rsName[:i]
 }

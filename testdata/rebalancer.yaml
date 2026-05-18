@@ -26,10 +26,6 @@ rules:
   - apiGroups: [apps]
     resources: [deployments]
     verbs: [list, watch]
-  # TODO: avoid requiring replicasets
-  - apiGroups: [apps]
-    resources: [replicasets]
-    verbs: [list, watch]
   - apiGroups: [""]
     resources: [pods]
     verbs: [list, watch, patch]

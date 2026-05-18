@@ -192,6 +192,17 @@ func (s *ControllerSuite) listPods(opts ...client.ListOption) []*corev1.Pod {
 	return ptrList(podList.Items, nil)
 }
 
+func ptrList[T any](items []T, accept func(*T) bool) []*T {
+	result := make([]*T, 0, len(items))
+	for i := range items {
+		item := &items[i]
+		if accept == nil || accept(item) {
+			result = append(result, item)
+		}
+	}
+	return result
+}
+
 func (s *ControllerSuite) requireEventuallyHasPhaseCounts(expected map[corev1.PodPhase]int, opts ...client.ListOption) {
 	t := s.T()
 	t.Helper()

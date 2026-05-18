@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"strings"
 	"time"
 
 	admissionv1 "k8s.io/api/admission/v1"
@@ -39,8 +38,8 @@ func (w *PodWebhook) Handle(ctx context.Context, req admission.Request) admissio
 		return admission.Allowed("gate already present")
 	}
 
-	deployName, ok := deploymentName(pod)
-	if !ok {
+	_, deployName := deploymentName(pod)
+	if deployName == "" {
 		return admission.Allowed("cannot derive Deployment name from pod")
 	}
 
@@ -66,23 +65,4 @@ func (w *PodWebhook) Handle(ctx context.Context, req admission.Request) admissio
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
 	return admission.PatchResponseFromRaw(req.Object.Raw, marshaled)
-}
-
-func deploymentName(pod *corev1.Pod) (string, bool) {
-	var rsName string
-	for _, ref := range pod.OwnerReferences {
-		if ref.Kind == "ReplicaSet" && ref.Controller != nil && *ref.Controller {
-			rsName = ref.Name
-			break
-		}
-	}
-	if rsName == "" {
-		return "", false
-	}
-
-	i := strings.LastIndex(rsName, "-")
-	if i <= 0 {
-		return "", false
-	}
-	return rsName[:i], true
 }
