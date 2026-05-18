@@ -78,6 +78,8 @@ docker build -t rebalancer .
 
 kind load docker-image rebalancer:latest
 
+kubectl apply -f testdata/rbac.yaml
+
 kubectl apply -f testdata/rebalancer.yaml
 ```
 

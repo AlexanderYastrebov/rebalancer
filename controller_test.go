@@ -28,15 +28,26 @@ import (
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+
+	"k8s.io/client-go/dynamic"
+
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/rest"
+
 	"k8s.io/client-go/tools/clientcmd"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	kindv1alpha4 "sigs.k8s.io/kind/pkg/apis/config/v1alpha4"
 	"sigs.k8s.io/kind/pkg/cluster"
+
+	"sigs.k8s.io/yaml"
 )
 
 // ControllerSuite holds shared state for all controller integration tests.
@@ -50,6 +61,8 @@ type ControllerSuite struct {
 	// controller under test
 	c *Controller
 
+	// admin/rest config from kind kubeconfig
+	restCfg *rest.Config
 	// shared k8s clients / state
 	directClient client.Client
 	reservedNode string
@@ -103,7 +116,8 @@ func (s *ControllerSuite) SetupSuite() {
 
 	kubeconfigRaw, err := s.provider.KubeConfig(s.clusterName, false)
 	require.NoError(t, err, "Failed to get kubeconfig")
-	restCfg, err := clientcmd.RESTConfigFromKubeConfig([]byte(kubeconfigRaw))
+
+	s.restCfg, err = clientcmd.RESTConfigFromKubeConfig([]byte(kubeconfigRaw))
 	require.NoError(t, err, "Failed to build REST config")
 
 	hostIP := kindHostIP(t, s.clusterName)
@@ -128,7 +142,14 @@ func (s *ControllerSuite) SetupSuite() {
 	s.c.DefaultWorkloadConfig.CheckInterval = 5 * time.Second
 	s.c.DefaultWorkloadConfig.ScheduleTimeout = 20 * time.Second
 
-	mgr, err := ctrl.NewManager(restCfg, ctrl.Options{
+	s.configureRBAC()
+
+	// Start the manager using a specific ServiceAccount from the RBAC manifest.
+	cfg := rest.CopyConfig(s.restCfg)
+	cfg.Impersonate = rest.ImpersonationConfig{
+		UserName: "system:serviceaccount:default:rebalancer",
+	}
+	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme: scheme,
 		WebhookServer: webhook.NewServer(webhook.Options{
 			Port:    webhookPort,
@@ -152,7 +173,7 @@ func (s *ControllerSuite) SetupSuite() {
 	require.NoError(t, appsv1.AddToScheme(clientScheme))
 	require.NoError(t, admissionregistrationv1.AddToScheme(clientScheme))
 
-	s.directClient, err = client.New(restCfg, client.Options{Scheme: clientScheme})
+	s.directClient, err = client.New(s.restCfg, client.Options{Scheme: clientScheme})
 	require.NoError(t, err, "Failed to create direct client")
 
 	registerWebhook(t, s.ctx, s.directClient, hostIP, webhookPort, caBundle)
@@ -673,4 +694,56 @@ func testNamespace(t *testing.T) string {
 		name = name[:63]
 	}
 	return name
+}
+
+// configureRBAC creates ServiceAccount, ClusterRole and ClusterRoleBinding objects.
+func (s *ControllerSuite) configureRBAC() {
+	t := s.T()
+	t.Helper()
+
+	b, err := os.ReadFile("testdata/rbac.yaml")
+	require.NoError(t, err)
+
+	docs := strings.Split(string(b), "\n---\n")
+
+	dc, err := dynamic.NewForConfig(s.restCfg)
+	require.NoError(t, err)
+	httpClient, err := rest.HTTPClientFor(s.restCfg)
+	require.NoError(t, err)
+	mapper, err := apiutil.NewDynamicRESTMapper(s.restCfg, httpClient)
+	require.NoError(t, err)
+
+	for _, d := range docs {
+		d = strings.TrimSpace(d)
+		if d == "" {
+			continue
+		}
+		j, err := yaml.YAMLToJSON([]byte(d))
+		require.NoError(t, err)
+
+		var u unstructured.Unstructured
+		err = u.UnmarshalJSON(j)
+		require.NoError(t, err)
+
+		gvk := u.GroupVersionKind()
+		mapping, err := mapper.RESTMapping(schema.GroupKind{Group: gvk.Group, Kind: gvk.Kind}, gvk.Version)
+		require.NoError(t, err)
+
+		resClient := dc.Resource(mapping.Resource)
+		if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
+			ns := u.GetNamespace()
+			if ns == "" {
+				ns = "default"
+			}
+			_, err := resClient.Namespace(ns).Create(t.Context(), &u, metav1.CreateOptions{})
+			require.NoError(t, err)
+
+			t.Logf("Created %s %s/%s", gvk.Kind, ns, u.GetName())
+		} else {
+			_, err := resClient.Create(t.Context(), &u, metav1.CreateOptions{})
+			require.NoError(t, err)
+
+			t.Logf("Created %s %s", gvk.Kind, u.GetName())
+		}
+	}
 }
