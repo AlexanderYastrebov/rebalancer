@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -12,6 +13,7 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -90,10 +92,13 @@ func main() {
 	var (
 		webhookPort    int
 		webhookCertDir string
+		healthAddr     string
 	)
 	fs.IntVar(&webhookPort, "webhook-port", 9443, "Port the mutating webhook server listens on")
 	fs.StringVar(&webhookCertDir, "webhook-cert-dir", os.Getenv("WEBHOOK_CERT_DIR"),
 		"Directory containing TLS cert and key for the webhook server")
+	fs.StringVar(&healthAddr, "health-address",
+		":8081", "TCP address for serving health probes. Use /readyz path for readiness check.")
 
 	config.RegisterFlags(fs)
 
@@ -107,26 +112,39 @@ func main() {
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 	logger := ctrl.Log.WithName("main")
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme: scheme,
-		WebhookServer: webhook.NewServer(webhook.Options{
-			Port:    webhookPort,
-			CertDir: webhookCertDir,
-		}),
+	if err := run(ctrl.SetupSignalHandler(), ctrl.GetConfigOrDie(), webhookPort, webhookCertDir, healthAddr, c); err != nil {
+		logger.Error(err, "Failed to run")
+		os.Exit(1)
+	}
+}
+
+func run(ctx context.Context, cfg *rest.Config, webhookPort int, webhookCertDir string, healthAddr string, c *Controller) error {
+	logger := ctrl.Log.WithName("main")
+
+	srv := webhook.NewServer(webhook.Options{
+		Port:    webhookPort,
+		CertDir: webhookCertDir,
+	})
+	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
+		Scheme:                 scheme,
+		WebhookServer:          srv,
+		HealthProbeBindAddress: healthAddr,
 	})
 	if err != nil {
-		logger.Error(err, "Unable to create manager")
-		os.Exit(1)
+		return fmt.Errorf("unable to create manager: %w", err)
+	}
+
+	if err := mgr.AddReadyzCheck("webhook", srv.StartedChecker()); err != nil {
+		return fmt.Errorf("unable to set up webhook readiness check: %w", err)
 	}
 
 	if err := c.SetupWithManager(mgr); err != nil {
-		logger.Error(err, "Unable to set up workload controller")
-		os.Exit(1)
+		return fmt.Errorf("unable to set up workload controller: %w", err)
 	}
 
 	logger.Info("Starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
-		logger.Error(err, "Problem running manager")
-		os.Exit(1)
+	if err := mgr.Start(ctx); err != nil {
+		return fmt.Errorf("problem running manager: %w", err)
 	}
+	return nil
 }

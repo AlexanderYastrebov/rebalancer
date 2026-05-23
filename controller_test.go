@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -42,7 +43,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
-	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	kindv1alpha4 "sigs.k8s.io/kind/pkg/apis/config/v1alpha4"
 	"sigs.k8s.io/kind/pkg/cluster"
 
@@ -69,7 +69,7 @@ type ControllerSuite struct {
 	// manager lifecycle
 	ctx     context.Context
 	cancel  context.CancelFunc
-	mgrDone chan error
+	runDone chan error
 
 	// per-test namespace (set in SetupTest)
 	ns string
@@ -82,7 +82,7 @@ func TestController(t *testing.T) {
 
 // Write redirects test namespace logs to the current test output.
 func (s *ControllerSuite) Write(p []byte) (int, error) {
-	if bytes.Contains(p, []byte(`"`+s.ns+`"`)) {
+	if s.ns == "" || bytes.Contains(p, []byte(`"`+s.ns+`"`)) {
 		return s.T().Output().Write(p)
 	}
 	return len(p), nil
@@ -126,7 +126,6 @@ func (s *ControllerSuite) SetupSuite() {
 	caBundle := generateWebhookCert(t, hostIP, certDir)
 
 	webhookPort := freePort(t)
-	t.Logf("Webhook server port: %d", webhookPort)
 
 	s.c = NewController()
 	s.c.DefaultWorkloadConfig.LabeledPercentage = 60
@@ -148,24 +147,21 @@ func (s *ControllerSuite) SetupSuite() {
 	cfg.Impersonate = rest.ImpersonationConfig{
 		UserName: "system:serviceaccount:default:rebalancer",
 	}
-	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme: scheme,
-		WebhookServer: webhook.NewServer(webhook.Options{
-			Port:    webhookPort,
-			CertDir: certDir,
-		}),
-	})
-	require.NoError(t, err, "Failed to create manager")
-	require.NoError(t, s.c.SetupWithManager(mgr), "Failed to set up controller")
+
+	healthPort := freePort(t)
+	healthAddr := fmt.Sprintf("127.0.0.1:%d", healthPort)
 
 	s.ctx, s.cancel = context.WithCancel(context.Background())
-	s.mgrDone = make(chan error, 1)
+	s.runDone = make(chan error, 1)
 	go func() {
-		s.mgrDone <- mgr.Start(s.ctx)
+		s.runDone <- run(s.ctx, cfg, webhookPort, certDir, healthAddr, s.c)
 	}()
 
-	require.True(t, mgr.GetCache().WaitForCacheSync(s.ctx), "Cache never synced")
-	waitForWebhook(t, s.ctx, hostIP, webhookPort)
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		rsp, err := http.Get("http://" + healthAddr + "/readyz")
+		require.NoError(c, err)
+		require.Equal(c, 200, rsp.StatusCode)
+	}, 1*time.Second, 100*time.Microsecond)
 
 	clientScheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(clientScheme))
@@ -184,7 +180,7 @@ func (s *ControllerSuite) SetupSuite() {
 func (s *ControllerSuite) TearDownSuite() {
 	t := s.T()
 	s.cancel()
-	if err := <-s.mgrDone; err != nil && s.ctx.Err() == nil {
+	if err := <-s.runDone; err != nil && s.ctx.Err() == nil {
 		t.Errorf("Manager exited with error: %v", err)
 	}
 	t.Logf("Deleting kind cluster %q", s.clusterName)
@@ -201,6 +197,10 @@ func (s *ControllerSuite) SetupTest() {
 	require.NoError(t, s.directClient.Create(s.ctx, &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{Name: s.ns},
 	}), "Failed to create namespace")
+}
+
+func (s *ControllerSuite) TearDownTest() {
+	s.ns = ""
 }
 
 // listPods returns all pods in the current test namespace matching the given options.
@@ -549,30 +549,6 @@ func generateWebhookCert(t *testing.T, hostIP string, dir string) []byte {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "tls.crt"), certPEM, 0o600), "Failed to write tls.crt")
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "tls.key"), keyPEM, 0o600), "Failed to write tls.key")
 	return certPEM
-}
-
-// waitForWebhook blocks until the webhook server is accepting TCP connections
-// on the local machine on the given port, or until ctx is cancelled.
-// (The server binds to all interfaces, so 127.0.0.1 always works on the host.)
-func waitForWebhook(t *testing.T, ctx context.Context, _ string, port int) {
-	t.Helper()
-	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
-	t.Logf("Waiting for webhook server at %s", addr)
-	for {
-		conn, err := net.DialTimeout("tcp", addr, time.Second)
-		if err == nil {
-			conn.Close()
-			t.Logf("Webhook server is ready at %s", addr)
-			// Brief pause to let the TLS handshaker fully initialise.
-			time.Sleep(500 * time.Millisecond)
-			return
-		}
-		select {
-		case <-ctx.Done():
-			require.Fail(t, "Context cancelled while waiting for webhook server")
-		case <-time.After(300 * time.Millisecond):
-		}
-	}
 }
 
 // registerWebhook creates a MutatingWebhookConfiguration that routes pod
