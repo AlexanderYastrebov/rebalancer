@@ -32,6 +32,8 @@ type WorkloadConfig struct {
 	// FallbackInterval is added to the disabled-until timestamp to determine
 	// when the reconciler should next attempt normal reconciliation.
 	FallbackInterval time.Duration `json:"fallbackInterval,omitempty"`
+	// RebalanceStabilizationPeriod is the minimum duration to wait between rebalance evictions.
+	RebalanceStabilizationPeriod time.Duration `json:"rebalanceStabilizationPeriod,omitempty"`
 }
 
 // Config holds the annotation and label key names used by the controller.
@@ -76,11 +78,12 @@ func NewController() *Controller {
 			Labels: map[string]string{
 				"rebalancer/labeled": "true",
 			},
-			LabeledPercentage: 100,
-			MinUnlabeled:      0,
-			CheckInterval:     30 * time.Second,
-			ScheduleTimeout:   5 * time.Minute,
-			FallbackInterval:  1 * time.Minute,
+			LabeledPercentage:            100,
+			MinUnlabeled:                 0,
+			CheckInterval:                30 * time.Second,
+			ScheduleTimeout:              5 * time.Minute,
+			FallbackInterval:             1 * time.Minute,
+			RebalanceStabilizationPeriod: 10 * time.Second,
 		},
 	}
 }

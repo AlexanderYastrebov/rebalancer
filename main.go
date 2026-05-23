@@ -78,6 +78,8 @@ func main() {
 		"Default time a labeled pod may remain Pending before the rebalancer is disabled and pending pods are evicted")
 	fs.DurationVar(&c.DefaultWorkloadConfig.FallbackInterval, "default-fallback-interval", c.DefaultWorkloadConfig.FallbackInterval,
 		"Default extra delay added to disabled-until before the reconciler resumes normal operation")
+	fs.DurationVar(&c.DefaultWorkloadConfig.RebalanceStabilizationPeriod, "default-rebalance-stabilization-period", c.DefaultWorkloadConfig.RebalanceStabilizationPeriod,
+		"Default minimum duration to wait between rebalance evictions")
 
 	// Flags to override Config.
 	fs.StringVar(&c.Config.ConfigAnnotation, "config-annotation", c.Config.ConfigAnnotation,

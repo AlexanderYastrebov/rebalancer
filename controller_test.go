@@ -139,6 +139,8 @@ func (s *ControllerSuite) SetupSuite() {
 	}}
 	s.c.DefaultWorkloadConfig.CheckInterval = 5 * time.Second
 	s.c.DefaultWorkloadConfig.ScheduleTimeout = 20 * time.Second
+	s.c.DefaultWorkloadConfig.FallbackInterval = 30 * time.Second
+	s.c.DefaultWorkloadConfig.RebalanceStabilizationPeriod = 1 * time.Second
 
 	s.configureRBAC()
 

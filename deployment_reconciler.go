@@ -1,19 +1,24 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"maps"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -27,6 +32,14 @@ type DeploymentReconciler struct {
 	Scheme                *runtime.Scheme
 	Config                Config
 	DefaultWorkloadConfig WorkloadConfig
+
+	// snapshots stores last observed deployment snapshots
+	snapshots sync.Map // map[types.NamespacedName]snapshot
+}
+
+type snapshot struct {
+	hash      []byte
+	timestamp time.Time
 }
 
 func (r *DeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -34,7 +47,11 @@ func (r *DeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	var deploy appsv1.Deployment
 	if err := r.Get(ctx, req.NamespacedName, &deploy); err != nil {
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+		if apierrors.IsNotFound(err) {
+			r.snapshots.Delete(req.NamespacedName)
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, err
 	}
 
 	// Update config
@@ -130,6 +147,12 @@ func (r *DeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return untilNextCheck()
 	}
 
+	stabilizeUntil := r.lastChanged(req.NamespacedName, pods).Add(cfg.RebalanceStabilizationPeriod)
+	if time.Now().Before(stabilizeUntil) {
+		logger.V(1).Info("Rebalance stabilization, skipping", "until", stabilizeUntil)
+		return ctrl.Result{RequeueAfter: time.Until(stabilizeUntil)}, nil
+	}
+
 	total := len(pods)
 	target := targetLabeledCount(total, cfg)
 	actual := len(labeled)
@@ -150,6 +173,10 @@ func (r *DeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		toEvict = unlabeled[:target-actual]
 		which = "unlabeled"
 	}
+
+	const rebalanceBurst = 1
+	toEvict = toEvict[:min(len(toEvict), rebalanceBurst)]
+
 	if len(toEvict) > 0 {
 		logger.Info("Evicting pods to rebalance", "total", total,
 			"actual", actual, "target", target, "evicting", len(toEvict), "which", which)
@@ -268,6 +295,22 @@ func (r *DeploymentReconciler) evictPod(ctx context.Context, pod *corev1.Pod) er
 	return r.SubResource("eviction").Create(ctx, pod, eviction)
 }
 
+func (r *DeploymentReconciler) lastChanged(namespacedName types.NamespacedName, pods []*corev1.Pod) time.Time {
+	lastChange := time.Now()
+	ph := podsHash(pods)
+	if v, ok := r.snapshots.Load(namespacedName); ok {
+		ps := v.(snapshot)
+		if bytes.Equal(ps.hash, ph) {
+			return ps.timestamp
+		}
+	}
+	r.snapshots.Store(namespacedName, snapshot{
+		hash:      ph,
+		timestamp: lastChange,
+	})
+	return lastChange
+}
+
 func (r *DeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&appsv1.Deployment{},
@@ -371,4 +414,21 @@ func deploymentName(pod *corev1.Pod) (string, string) {
 		return rsName, ""
 	}
 	return rsName, rsName[:i]
+}
+
+func podsHash(pods []*corev1.Pod) []byte {
+	copy := slices.Clone(pods)
+	slices.SortFunc(copy, func(a, b *corev1.Pod) int {
+		if c := strings.Compare(a.Name, b.Name); c != 0 {
+			return c
+		}
+		return strings.Compare(string(a.Status.Phase), string(b.Status.Phase))
+	})
+
+	h := sha256.New()
+	for _, pod := range copy {
+		h.Write([]byte(pod.Name))
+		h.Write([]byte(pod.Status.Phase))
+	}
+	return h.Sum(nil)
 }
