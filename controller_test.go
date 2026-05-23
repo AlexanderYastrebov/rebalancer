@@ -585,9 +585,9 @@ func registerWebhook(t *testing.T, ctx context.Context, c client.Client, ip stri
 	failurePolicy := admissionregistrationv1.Fail
 
 	whc := &admissionregistrationv1.MutatingWebhookConfiguration{
-		ObjectMeta: metav1.ObjectMeta{Name: "rebalancer-test-pod-webhook"},
+		ObjectMeta: metav1.ObjectMeta{Name: "rebalancer"},
 		Webhooks: []admissionregistrationv1.MutatingWebhook{{
-			Name:                    "rebalancer.test.pod",
+			Name:                    "rebalancer.example.test",
 			AdmissionReviewVersions: []string{"v1"},
 			SideEffects:             &sideEffects,
 			FailurePolicy:           &failurePolicy,
@@ -597,7 +597,7 @@ func registerWebhook(t *testing.T, ctx context.Context, c client.Client, ip stri
 			},
 			Rules: []admissionregistrationv1.RuleWithOperations{{
 				Operations: []admissionregistrationv1.OperationType{
-					admissionregistrationv1.OperationAll,
+					admissionregistrationv1.Create,
 				},
 				Rule: admissionregistrationv1.Rule{
 					APIGroups:   []string{""},
@@ -610,7 +610,7 @@ func registerWebhook(t *testing.T, ctx context.Context, c client.Client, ip stri
 
 	require.NoError(t, c.Create(ctx, whc), "Failed to create MutatingWebhookConfiguration")
 	t.Cleanup(func() {
-		_ = c.Delete(context.Background(), whc)
+		_ = c.Delete(t.Context(), whc)
 	})
 	t.Logf("Registered MutatingWebhookConfiguration pointing to %s", url)
 }
